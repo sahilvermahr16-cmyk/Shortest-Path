@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Route Planner</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+        }
+        canvas {
+            cursor: crosshair;
+            touch-action: none;
+        }
+        .loader {
+            border: 8px solid #f3f3f3;
+            border-top: 8px solid #3498db;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white flex flex-col h-screen antialiased">
+
+    <!-- Header -->
+    <header class="bg-gray-800 shadow-lg z-10">
+        <div class="container mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <h1 class="text-2xl font-bold text-white">Route Planner</h1>
+                <div class="flex items-center space-x-4">
+                    <label for="file-upload" class="relative cursor-pointer bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition-transform transform hover:scale-105">
+                        <span>Load map.osm File</span>
+                        <input id="file-upload" name="file-upload" type="file" class="sr-only" accept=".osm">
+                    </label>
+                    <button id="reset-button" class="bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition-transform transform hover:scale-105">Reset</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-grow flex items-stretch overflow-hidden">
+        <!-- Sidebar -->
+        <aside class="w-full sm:w-80 bg-gray-800 p-6 flex-shrink-0 overflow-y-auto">
+            <h2 class="text-xl font-semibold mb-4 border-b border-gray-700 pb-2">Instructions</h2>
+            <div id="instructions" class="space-y-4 text-gray-300">
+                <div class="flex items-start">
+                    <div class="flex-shrink-0 h-6 w-6 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold mr-3">1</div>
+                    <p>Click "Load map.osm File" to load your map data.</p>
+                </div>
+                 <div class="flex items-start">
+                    <div class="flex-shrink-0 h-6 w-6 rounded-full bg-gray-600 text-white flex items-center justify-center font-bold mr-3">2</div>
+                    <p>Click anywhere on the map to set the **start point**.</p>
+                </div>
+                 <div class="flex items-start">
+                    <div class="flex-shrink-0 h-6 w-6 rounded-full bg-gray-600 text-white flex items-center justify-center font-bold mr-3">3</div>
+                    <p>Click a second time to set the **end point** and find the path.</p>
+                </div>
+            </div>
+            <div id="status" class="mt-6 text-lg font-medium text-yellow-400"></div>
+            <div id="results" class="mt-4 text-gray-300 space-y-2 hidden">
+                <p><span class="font-semibold text-white">Distance:</span> <span id="distance"></span> meters</p>
+            </div>
+            <div id="loading" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center hidden z-50">
+                <div class="text-center">
+                    <div class="loader mx-auto"></div>
+                    <p class="mt-4 text-xl font-semibold">Parsing Map Data...</p>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Canvas -->
+        <div class="flex-grow bg-gray-700 flex items-center justify-center relative overflow-hidden">
+            <canvas id="map-canvas" class="bg-gray-200 rounded-lg shadow-inner"></canvas>
+        </div>
+    </main>
+
+    <script>
+        // --- DOM Elements ---
+        const canvas = document.getElementById('map-canvas');
+        const ctx = canvas.getContext('2d');
+        const fileUpload = document.getElementById('file-upload');
+        const resetButton = document.getElementById('reset-button');
+        const statusEl = document.getElementById('status');
+        const resultsEl = document.getElementById('results');
+        const distanceEl = document.getElementById('distance');
+        const loadingEl = document.getElementById('loading');
+        const instructionSteps = document.querySelectorAll('#instructions > div');
+
+        // --- App State ---
+        let model = null;
+        let startPoint = null;
+        let endPoint = null;
+        let path = [];
+        
+        // --- Canvas Panning and Zooming State ---
+        let transform = { x: 0, y: 0, scale: 1 };
+        let isPanning = false;
+        let panStart = { x: 0, y: 0 };
+
+        // --- A* Node Class ---
+        class Node {
+            constructor(id, x, y) {
+                this.id = id;
+                this.x = x;
+                this.y = y;
+                this.parent = null;
+                this.neighbors = [];
+                this.g = Infinity; // Distance from start
+                this.h = 0;        // Heuristic distance to end
+                this.f = Infinity; // g + h
+            }
+
+            distanceTo(otherNode) {
+                return Math.sqrt(Math.pow(this.x - otherNode.x, 2) + Math.pow(this.y - otherNode.y, 2));
+            }
+        }
+
+        // --- Map Model Class ---
+        class RouteModel {
+            constructor(xmlText) {
+                this.nodes = new Map();
+                this.ways = [];
+                this.bounds = { minLat: Infinity, maxLat: -Infinity, minLon: Infinity, maxLon: -Infinity };
+                this.parseOSM(xmlText);
+            }
+
+            parseOSM(xmlText) {
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(xmlText, "application/xml");
+                
+                // Parse bounds
+                const boundsEl = xmlDoc.querySelector('bounds');
+                if (boundsEl) {
+                    this.bounds.minLat = parseFloat(boundsEl.getAttribute('minlat'));
+                    this.bounds.maxLat = parseFloat(boundsEl.getAttribute('maxlat'));
+                    this.bounds.minLon = parseFloat(boundsEl.getAttribute('minlon'));
+                    this.bounds.maxLon = parseFloat(boundsEl.getAttribute('maxlon'));
+                }
+
+                // Parse nodes
+                xmlDoc.querySelectorAll('node').forEach(nodeEl => {
+                    const id = nodeEl.getAttribute('id');
+                    const lat = parseFloat(nodeEl.getAttribute('lat'));
+                    const lon = parseFloat(nodeEl.getAttribute('lon'));
+                    this.nodes.set(id, new Node(id, lon, lat));
+                });
+                
+                // Parse ways and build neighbor connections
+                xmlDoc.querySelectorAll('way').forEach(wayEl => {
+                    const nodeRefs = Array.from(wayEl.querySelectorAll('nd')).map(nd => nd.getAttribute('ref'));
+                    this.ways.push(nodeRefs);
+
+                    for (let i = 0; i < nodeRefs.length - 1; i++) {
+                        const node1 = this.nodes.get(nodeRefs[i]);
+                        const node2 = this.nodes.get(nodeRefs[i + 1]);
+                        if (node1 && node2) {
+                            node1.neighbors.push(node2);
+                            node2.neighbors.push(node1);
+                        }
+                    }
+                });
+            }
+
+            findClosestNode(x, y) {
+                let closestNode = null;
+                let minDistance = Infinity;
+
+                for (const node of this.nodes.values()) {
+                    const distance = Math.sqrt(Math.pow(node.x - x, 2) + Math.pow(node.y - y, 2));
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        closestNode = node;
+                    }
+                }
+                return closestNode;
+            }
+        }
+
+        // --- A* Search Algorithm ---
+        function aStarSearch(startNode, endNode) {
+            const openSet = new Set([startNode]);
+            const cameFrom = new Map();
+
+            startNode.g = 0;
+            startNode.h = startNode.distanceTo(endNode);
+            startNode.f = startNode.h;
+
+            while (openSet.size > 0) {
+                let currentNode = null;
+                let lowestF = Infinity;
+                for (const node of openSet) {
+                    if (node.f < lowestF) {
+                        lowestF = node.f;
+                        currentNode = node;
+                    }
+                }
+
+                if (currentNode === endNode) {
+                    return reconstructPath(cameFrom, currentNode);
+                }
+
+                openSet.delete(currentNode);
+
+                for (const neighbor of currentNode.neighbors) {
+                    const tentativeG = currentNode.g + currentNode.distanceTo(neighbor);
+                    if (tentativeG < neighbor.g) {
+                        cameFrom.set(neighbor, currentNode);
+                        neighbor.g = tentativeG;
+                        neighbor.h = neighbor.distanceTo(endNode);
+                        neighbor.f = neighbor.g + neighbor.h;
+                        openSet.add(neighbor);
+                    }
+                }
+            }
+            return []; // No path found
+        }
+
+        function reconstructPath(cameFrom, current) {
+            const totalPath = [current];
+            while (cameFrom.has(current)) {
+                current = cameFrom.get(current);
+                totalPath.unshift(current);
+            }
+            return totalPath;
+        }
+
+        // --- Canvas Drawing ---
+        function resizeCanvas() {
+            const container = canvas.parentElement;
+            const size = Math.min(container.clientWidth, container.clientHeight) * 0.95;
+            canvas.width = size;
+            canvas.height = size;
+            draw();
+        }
+
+        function project(lon, lat) {
+            const scale = Math.min(canvas.width / (model.bounds.maxLon - model.bounds.minLon), canvas.height / (model.bounds.maxLat - model.bounds.minLat));
+            const x = (lon - model.bounds.minLon) * scale;
+            const y = (model.bounds.maxLat - lat) * scale; // Invert Y-axis
+            return { x, y };
+        }
+
+        function unproject(x, y) {
+             const scale = Math.min(canvas.width / (model.bounds.maxLon - model.bounds.minLon), canvas.height / (model.bounds.maxLat - model.bounds.minLat));
+             const lon = (x / scale) + model.bounds.minLon;
+             const lat = model.bounds.maxLat - (y / scale);
+             return { lon, lat };
+        }
+
+        function draw() {
+            if (!model) return;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(transform.x, transform.y);
+            ctx.scale(transform.scale, transform.scale);
+
+            // Draw ways
+            ctx.strokeStyle = '#a0aec0'; // gray-500
+            ctx.lineWidth = 1 / transform.scale;
+            ctx.beginPath();
+            model.ways.forEach(way => {
+                const startNode = model.nodes.get(way[0]);
+                if (!startNode) return;
+                const pStart = project(startNode.x, startNode.y);
+                ctx.moveTo(pStart.x, pStart.y);
+                for (let i = 1; i < way.length; i++) {
+                    const node = model.nodes.get(way[i]);
+                    if (!node) continue;
+                    const p = project(node.x, node.y);
+                    ctx.lineTo(p.x, p.y);
+                }
+            });
+            ctx.stroke();
+
+            // Draw path
+            if (path.length > 0) {
+                ctx.strokeStyle = '#e53e3e'; // red-600
+                ctx.lineWidth = 4 / transform.scale;
+                ctx.beginPath();
+                const pStart = project(path[0].x, path[0].y);
+                ctx.moveTo(pStart.x, pStart.y);
+                for (let i = 1; i < path.length; i++) {
+                    const p = project(path[i].x, path[i].y);
+                    ctx.lineTo(p.x, p.y);
+                }
+                ctx.stroke();
+            }
+
+            // Draw start and end points
+            if (startPoint) drawPoint(startPoint, '#38a169'); // green-600
+            if (endPoint) drawPoint(endPoint, '#3182ce'); // blue-600
+
+            ctx.restore();
+        }
+        
+        function drawPoint(point, color) {
+            const p = project(point.x, point.y);
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 6 / transform.scale, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+
+        // --- Event Handlers ---
+        fileUpload.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            loadingEl.classList.remove('hidden');
+            statusEl.textContent = 'Loading and parsing map...';
+            resultsEl.classList.add('hidden');
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                setTimeout(() => { // Give browser time to show loader
+                    try {
+                        model = new RouteModel(e.target.result);
+                        resetState();
+                        updateInstructionStep(1, true);
+                        updateInstructionStep(2, false);
+                        statusEl.textContent = 'Map loaded. Click to set start point.';
+                    } catch (error) {
+                        console.error("Error parsing OSM file:", error);
+                        statusEl.textContent = 'Error: Could not parse map file.';
+                        model = null;
+                    } finally {
+                        loadingEl.classList.add('hidden');
+                        draw();
+                    }
+                }, 50);
+            };
+            reader.readAsText(file);
+        });
+
+        resetButton.addEventListener('click', () => {
+            resetState();
+            if (model) {
+                statusEl.textContent = 'Map loaded. Click to set start point.';
+            } else {
+                statusEl.textContent = 'Load a map file to begin.';
+            }
+            draw();
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.button === 1) { // Middle mouse button
+                isPanning = true;
+                panStart = { x: e.clientX, y: e.clientY };
+                canvas.style.cursor = 'grabbing';
+                e.preventDefault();
+            }
+        });
+        
+        canvas.addEventListener('mousemove', (e) => {
+            if (isPanning) {
+                const dx = e.clientX - panStart.x;
+                const dy = e.clientY - panStart.y;
+                transform.x += dx;
+                transform.y += dy;
+                panStart = { x: e.clientX, y: e.clientY };
+                draw();
+            }
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (e.button === 1) {
+                isPanning = false;
+                canvas.style.cursor = 'crosshair';
+            }
+        });
+        
+        canvas.addEventListener('mouseleave', () => {
+             isPanning = false;
+             canvas.style.cursor = 'crosshair';
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            
+            const scaleFactor = e.deltaY < 0 ? 1.1 : 0.9;
+            
+            transform.x = mouseX - (mouseX - transform.x) * scaleFactor;
+            transform.y = mouseY - (mouseY - transform.y) * scaleFactor;
+            transform.scale *= scaleFactor;
+            
+            draw();
+        });
+
+        canvas.addEventListener('click', (e) => {
+            if (!model) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const canvasX = (e.clientX - rect.left - transform.x) / transform.scale;
+            const canvasY = (e.clientY - rect.top - transform.y) / transform.scale;
+
+            const { lon, lat } = unproject(canvasX, canvasY);
+            const clickedNode = model.findClosestNode(lon, lat);
+
+            if (!startPoint) {
+                startPoint = clickedNode;
+                updateInstructionStep(2, true);
+                updateInstructionStep(3, false);
+                statusEl.textContent = 'Start point set. Click to set end point.';
+            } else if (!endPoint) {
+                endPoint = clickedNode;
+                updateInstructionStep(3, true);
+                statusEl.textContent = 'Calculating shortest path...';
+                
+                // Reset g/h/f values before new search
+                model.nodes.forEach(node => {
+                    node.g = Infinity;
+                    node.h = 0;
+                    node.f = Infinity;
+                });
+
+                setTimeout(() => { // Allow UI to update
+                    path = aStarSearch(startPoint, endPoint);
+                    if (path.length > 0) {
+                        statusEl.textContent = 'Shortest path found!';
+                        const totalDistance = calculatePathDistance(path);
+                        distanceEl.textContent = totalDistance.toFixed(2);
+                        resultsEl.classList.remove('hidden');
+                    } else {
+                        statusEl.textContent = 'Could not find a path between the points.';
+                    }
+                    draw();
+                }, 50);
+            }
+            draw();
+        });
+
+        // --- Utility Functions ---
+        function resetState() {
+            startPoint = null;
+            endPoint = null;
+            path = [];
+            resultsEl.classList.add('hidden');
+            instructionSteps.forEach((step, index) => {
+                updateInstructionStep(index + 1, false);
+            });
+            if (model) updateInstructionStep(1, true);
+        }
+        
+        function updateInstructionStep(step, isComplete) {
+            const stepEl = instructionSteps[step - 1];
+            if (!stepEl) return;
+            const circleEl = stepEl.querySelector('div:first-child');
+            if (isComplete) {
+                circleEl.classList.remove('bg-gray-600');
+                circleEl.classList.add('bg-green-600');
+                circleEl.innerHTML = '&#10003;'; // Checkmark
+            } else {
+                circleEl.classList.remove('bg-green-600');
+                circleEl.classList.add('bg-gray-600');
+                circleEl.textContent = step;
+            }
+        }
+
+        function calculatePathDistance(path) {
+            let totalDistance = 0;
+            for (let i = 0; i < path.length - 1; i++) {
+                // Using Haversine formula for distance between lat/lon points
+                totalDistance += haversineDistance(path[i], path[i+1]);
+            }
+            return totalDistance;
+        }
+
+        function haversineDistance(node1, node2) {
+            const R = 6371e3; // Earth's radius in metres
+            const φ1 = node1.y * Math.PI/180;
+            const φ2 = node2.y * Math.PI/180;
+            const Δφ = (node2.y-node1.y) * Math.PI/180;
+            const Δλ = (node2.x-node1.x) * Math.PI/180;
+
+            const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                      Math.cos(φ1) * Math.cos(φ2) *
+                      Math.sin(Δλ/2) * Math.sin(Δλ/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+            return R * c; // in metres
+        }
+
+        // --- Initial Setup ---
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        statusEl.textContent = 'Load a map file to begin.';
+
+    </script>
+</body>
+</html>
